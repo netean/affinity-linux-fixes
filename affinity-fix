@@ -1,0 +1,519 @@
+#!/usr/bin/env bash
+# affinity-fix - fixes and an updater for Affinity (by Canva, v3) running under Wine on Linux.
+# https://github.com/netean/affinity-linux-fixes
+#
+# Builds on the AffinityOnLinux guides (https://github.com/seapear/AffinityOnLinux) and
+# AffinityPluginLoader/WineFix by noahc3 (https://github.com/noahc3/AffinityPluginLoader).
+set -euo pipefail
+
+VERSION="1.0.0"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/affinity-fix"
+CONFIG="$CONFIG_DIR/config"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/affinity-fix"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+BIN_DIR="$HOME/.local/bin"
+DESKTOP_FILE="$APPS_DIR/affinity-fix-url-handler.desktop"
+
+AFFINITY_INSTALLER_URL="https://downloads.affinity.studio/Affinity%20x64.exe"
+APL_REPO="noahc3/AffinityPluginLoader"
+APL_BUNDLE="affinitypluginloader-plus-winefix.tar.xz"
+LOGINFIX_TARBALL="https://codeload.github.com/seapear/AffinityOnLinux/tar.gz/refs/heads/main"
+LOGINFIX_PATH="AffinityOnLinux-main/Guides/Wine/LoginFix"
+DOTNET_SDK_IMAGE="mcr.microsoft.com/dotnet/sdk:8.0"
+# Microsoft's .NET Framework 4.8 offline installer (same URL winetricks uses).
+NDP48_URL="https://download.visualstudio.microsoft.com/download/pr/7afca223-55d2-470a-8edc-6a1739ae3252/abd170b4b0ec15ad0222a809b761a036/ndp48-x86-x64-allos-enu.exe"
+NDP48_SHA256="95889d6de3f2070c07790ad6cf2000d33d9a1bdfc6a381725ab82ab1c314fd53"
+NDP48_CAB="x64-Windows10.0-KB4486153-x64.cab"
+# WinRT .NET facades that dotnet48 doesn't install under Wine (Windows 8+ only component).
+# Without them Affinity crashes when the Canva sign-in callback arrives.
+FACADES=(
+    "System.Runtime.WindowsRuntime|1e1e6b4ac4e758fe1066e315f7928c393e1216dbe55c318803dd107123e1a8e3"
+    "System.Runtime.WindowsRuntime.UI.Xaml|8e035a8667213e5a87b69757251a00c7c5f72c5b1b8f7578ec20688629b189e1"
+)
+APL_FILES=(AffinityHook.exe AffinityBootstrap.dll AffinityPluginLoader.dll 0Harmony.dll d2d1.dll)
+
+# ---------------------------------------------------------------- output helpers
+if [ -t 1 ]; then B=$'\033[1m'; BL=$'\033[1;34m'; YE=$'\033[1;33m'; RE=$'\033[1;31m'; GR=$'\033[1;32m'; N=$'\033[0m'
+else B=; BL=; YE=; RE=; GR=; N=; fi
+say()  { printf '%s==>%s %s\n' "$BL" "$N" "$*"; }
+ok()   { printf '%s ok%s %s\n' "$GR" "$N" "$*"; }
+warn() { printf '%s !!%s %s\n' "$YE" "$N" "$*" >&2; }
+die()  { printf '%s xx%s %s\n' "$RE" "$N" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+${B}affinity-fix $VERSION${N} - fixes and updater for Affinity (by Canva) under Wine
+
+${B}Usage:${N} affinity-fix <command> [options]
+
+${B}Commands${N}
+  install       Detect your Affinity setup and apply every fix (safe to re-run)
+  update        Download the latest Affinity, install it, then re-apply the fixes
+  check         Show installed vs latest Affinity and the state of each fix
+  plugins       Update/re-apply only the plugin fixes (no Affinity reinstall)
+  uninstall     Remove the fixes (leaves Affinity and your settings alone)
+  open-url URL  Pass an affinity:// URL to Affinity (used by the browser handler)
+
+${B}Options for install${N}
+  --prefix DIR      Wine prefix containing Affinity (default: auto-detect)
+  --wine PATH       wine binary to use (default: from Lutris, else 'wine')
+  --flatpak-lutris  Run Wine inside the Flatpak Lutris sandbox
+  --lutris-yml F    Lutris game config to point at the plugin loader
+  --no-backup       Don't snapshot the prefix first
+
+${B}Options for update${N}
+  --force           Reinstall Affinity even if the installer hasn't changed
+  --no-backup       Don't snapshot the prefix first
+
+Config: $CONFIG
+EOF
+}
+
+# ---------------------------------------------------------------- config / detection
+load_config() {
+    [ -f "$CONFIG" ] || die "Not set up yet. Run: affinity-fix install"
+    # shellcheck source=/dev/null
+    source "$CONFIG"
+    APPDIR="$AFF_PREFIX/drive_c/Program Files/Affinity/Affinity"
+    [ -f "$APPDIR/Affinity.exe" ] || die "Affinity.exe not found in $APPDIR"
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG" <<EOF
+# Written by affinity-fix install. Edit if your setup changes, or re-run install.
+AFF_PREFIX=$(printf %q "$AFF_PREFIX")
+AFF_WINE=$(printf %q "$AFF_WINE")
+AFF_FLATPAK_LUTRIS=$AFF_FLATPAK_LUTRIS
+AFF_LUTRIS_YML=$(printf %q "$AFF_LUTRIS_YML")
+EOF
+}
+
+# Prints "yml|runners_dir|flatpak(0/1)" for each Lutris game whose exe is Affinity.
+find_lutris_games() {
+    local base flat yml
+    for spec in "$HOME/.var/app/net.lutris.Lutris/data/lutris|1" "$HOME/.local/share/lutris|0" "$HOME/.config/lutris|0"; do
+        base=${spec%|*}; flat=${spec#*|}
+        [ -d "$base/games" ] || continue
+        for yml in "$base"/games/*.yml; do
+            [ -f "$yml" ] || continue
+            grep -qE '^  exe: .*Affinity/Affinity/(Affinity|AffinityHook)\.exe' "$yml" || continue
+            local runners="$base/runners/wine"
+            [ -d "$runners" ] || runners="$HOME/.var/app/net.lutris.Lutris/data/lutris/runners/wine"
+            echo "$yml|$runners|$flat"
+        done
+    done
+}
+
+yml_value() { # $1 file, $2 key under game:/wine:, first match with given indent
+    grep -m1 -E "^  $2: " "$1" | sed -E "s/^  $2: //; s/^['\"]//; s/['\"]$//"
+}
+
+detect_setup() {
+    if [ -n "${OPT_PREFIX:-}" ]; then
+        AFF_PREFIX=$(readlink -f "$OPT_PREFIX")
+        AFF_WINE=${OPT_WINE:-$(command -v wine || true)}
+        AFF_FLATPAK_LUTRIS=${OPT_FLATPAK:-0}
+        AFF_LUTRIS_YML=${OPT_YML:-}
+        [ -n "$AFF_WINE" ] || die "No wine found; pass --wine PATH"
+        return
+    fi
+    local games=() line
+    while IFS= read -r line; do games+=("$line"); done < <(find_lutris_games)
+    if [ ${#games[@]} -eq 0 ]; then
+        if [ -f "$HOME/.affinity/drive_c/Program Files/Affinity/Affinity/Affinity.exe" ]; then
+            say "No Lutris game found; using the AffinityOnLinux default prefix ~/.affinity"
+            AFF_PREFIX="$HOME/.affinity"; AFF_WINE=${OPT_WINE:-$(command -v wine || true)}
+            AFF_FLATPAK_LUTRIS=0; AFF_LUTRIS_YML=""
+            [ -n "$AFF_WINE" ] || die "No wine found; pass --wine PATH"
+            return
+        fi
+        die "Couldn't find Affinity. Pass --prefix DIR (and --wine PATH)."
+    fi
+    if [ ${#games[@]} -gt 1 ]; then
+        warn "Found more than one Lutris Affinity game; using the first:"
+        printf '     %s\n' "${games[@]%%|*}" >&2
+        warn "Pass --lutris-yml FILE to choose another."
+    fi
+    local pick="${games[0]}"
+    if [ -n "${OPT_YML:-}" ]; then
+        pick=""; for line in "${games[@]}"; do [ "${line%%|*}" = "$(readlink -f "$OPT_YML")" ] && pick=$line; done
+        [ -n "$pick" ] || die "$OPT_YML isn't an Affinity Lutris game"
+    fi
+    IFS='|' read -r AFF_LUTRIS_YML runners AFF_FLATPAK_LUTRIS <<<"$pick"
+    AFF_PREFIX=$(yml_value "$AFF_LUTRIS_YML" prefix)
+    local runner; runner=$(grep -m1 -E '^version: ' "$AFF_LUTRIS_YML" | sed 's/^version: //')
+    [ -n "$runner" ] || runner=$(yml_value "$AFF_LUTRIS_YML" version)
+    if [ -n "${OPT_WINE:-}" ]; then AFF_WINE=$OPT_WINE
+    elif [ -n "$runner" ] && [ -x "$runners/$runner/bin/wine" ]; then AFF_WINE="$runners/$runner/bin/wine"
+    else AFF_WINE=$(command -v wine || true); warn "Lutris runner '$runner' not found; using system wine"
+    fi
+    [ -n "${OPT_FLATPAK:-}" ] && AFF_FLATPAK_LUTRIS=$OPT_FLATPAK
+    [ -n "$AFF_PREFIX" ] && [ -n "$AFF_WINE" ] || die "Couldn't read prefix/runner from $AFF_LUTRIS_YML"
+}
+
+# ---------------------------------------------------------------- wine wrappers
+# Under Flatpak Lutris, Wine must run inside the same sandbox so it shares /tmp (and
+# therefore the wineserver) with an Affinity launched from Lutris. ESYNC/FSYNC match
+# Lutris's defaults so the client and the running wineserver agree.
+run_wine() {
+    if [ "$AFF_FLATPAK_LUTRIS" = 1 ]; then
+        flatpak run --command=env net.lutris.Lutris WINEPREFIX="$AFF_PREFIX" \
+            WINEESYNC=1 WINEFSYNC=1 WINEDEBUG="${WINEDEBUG:--all}" "$AFF_WINE" "$@"
+    elif [ -n "$AFF_LUTRIS_YML" ]; then
+        env WINEPREFIX="$AFF_PREFIX" WINEESYNC=1 WINEFSYNC=1 WINEDEBUG="${WINEDEBUG:--all}" "$AFF_WINE" "$@"
+    else
+        env WINEPREFIX="$AFF_PREFIX" WINEDEBUG="${WINEDEBUG:--all}" "$AFF_WINE" "$@"
+    fi
+}
+run_wineserver() {
+    local ws; ws="$(dirname "$AFF_WINE")/wineserver"; [ -x "$ws" ] || ws=wineserver
+    if [ "$AFF_FLATPAK_LUTRIS" = 1 ]; then
+        flatpak run --command=env net.lutris.Lutris WINEPREFIX="$AFF_PREFIX" WINEESYNC=1 WINEFSYNC=1 "$ws" "$@"
+    else
+        env WINEPREFIX="$AFF_PREFIX" WINEESYNC=1 WINEFSYNC=1 "$ws" "$@"
+    fi
+}
+
+# True if an Affinity process is running. Checks each process's program (argv[0]) only,
+# so shells or editors whose command lines merely mention Affinity don't count.
+affinity_running() {
+    local pid a0
+    for pid in $(pgrep -f 'Affinity' 2>/dev/null); do
+        a0=$( { tr '\0' '\n' < "/proc/$pid/cmdline"; } 2>/dev/null | head -n1) || continue
+        case "$a0" in
+            *\\Affinity.exe|*/Affinity.exe|*\\AffinityHook.exe|*/AffinityHook.exe) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+installed_version() {
+    python3 -I - "$APPDIR/Affinity.exe" <<'PY'
+import sys
+d = open(sys.argv[1], "rb").read()
+k = "ProductVersion".encode("utf-16le")
+i = d.rfind(k)
+if i < 0: print("unknown"); sys.exit()
+i += len(k)
+while d[i:i+2] == b"\0\0": i += 2
+j = d.find(b"\0\0", i); j += (j - i) % 2
+print(d[i:j].decode("utf-16le"))
+PY
+}
+
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# ---------------------------------------------------------------- steps
+snapshot_prefix() {
+    [ "${OPT_NO_BACKUP:-0}" = 1 ] && { warn "Skipping backup (--no-backup)"; return; }
+    local dest; dest="$AFF_PREFIX.backup-$(date +%Y%m%d-%H%M)"
+    say "Backing up prefix -> $dest"
+    if ! cp -a --reflink=always "$AFF_PREFIX" "$dest" 2>/dev/null; then
+        rm -rf "$dest"
+        warn "Filesystem can't reflink; making a full copy ($(du -sh "$AFF_PREFIX" | cut -f1))"
+        cp -a "$AFF_PREFIX" "$dest"
+    fi
+    # keep the 3 newest backups made by this tool
+    ls -1dt "$AFF_PREFIX".backup-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9] 2>/dev/null | tail -n +4 | while read -r old; do
+        say "Removing old backup $old"; rm -rf --one-file-system "$old"
+    done
+}
+
+dotnet_build() { # $1 = source dir with csproj
+    if command -v dotnet >/dev/null && dotnet --list-sdks 2>/dev/null | grep -q .; then
+        (cd "$1" && dotnet build -c Release -nologo -v quiet >/dev/null)
+        return
+    fi
+    local engine
+    for engine in podman docker; do
+        if command -v $engine >/dev/null; then
+            say "Building with a throwaway .NET SDK container ($engine)"
+            $engine run --rm -q -v "$1":/src:Z -w /src "$DOTNET_SDK_IMAGE" \
+                dotnet build -c Release -nologo -v quiet >/dev/null
+            return
+        fi
+    done
+    return 1
+}
+
+fetch_plugins() {
+    local latest current dir work
+    latest=$(curl -sf "https://api.github.com/repos/$APL_REPO/releases/latest" \
+        | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' 2>/dev/null || true)
+    current=$(cat "$CACHE/apl.tag" 2>/dev/null || true)
+    if [ -z "$latest" ]; then
+        [ -n "$current" ] || die "Can't reach GitHub and nothing cached"
+        warn "Can't reach GitHub; using cached plugins $current"; return
+    fi
+    if [ "$latest" = "$current" ] && [ -f "$CACHE/apl-$current/$APL_BUNDLE" ]; then
+        ok "AffinityPluginLoader + WineFix $current (cached)"
+        [ -f "$CACHE/apl-$current/LoginFix.dll" ] && return
+    fi
+    dir="$CACHE/apl-$latest"; mkdir -p "$dir"
+    if [ ! -f "$dir/$APL_BUNDLE" ]; then
+        say "Downloading AffinityPluginLoader + WineFix $latest"
+        curl -fL --progress-bar -o "$dir/$APL_BUNDLE.part" \
+            "https://github.com/$APL_REPO/releases/download/$latest/$APL_BUNDLE"
+        mv "$dir/$APL_BUNDLE.part" "$dir/$APL_BUNDLE"
+    fi
+    echo "$latest" > "$CACHE/apl.tag"
+
+    # LoginFix has no binary release and must be compiled against the matching loader.
+    say "Fetching LoginFix source (seapear/AffinityOnLinux)"
+    work=$(mktemp -d)
+    if curl -sfL "$LOGINFIX_TARBALL" | tar -xz -C "$work" --strip-components=4 "$LOGINFIX_PATH" \
+        && [ -f "$work/LoginFix.csproj" ]; then
+        mkdir -p "$work/x"; tar -xf "$dir/$APL_BUNDLE" -C "$work/x"
+        cp "$work/x/AffinityPluginLoader.dll" "$work/"; rm -rf "$work/x"
+        if dotnet_build "$work" && [ -f "$work/bin/Release/net48/win-x64/LoginFix.dll" ]; then
+            cp "$work/bin/Release/net48/win-x64/LoginFix.dll" "$dir/"
+            ok "Built LoginFix"
+        else
+            warn "Couldn't build LoginFix (needs a .NET SDK, podman or docker). Canva sign-in won't work."
+        fi
+    else
+        warn "Couldn't fetch LoginFix source. Canva sign-in won't work."
+    fi
+    rm -rf "$work"
+}
+
+apply_plugins() {
+    local tag dir
+    tag=$(cat "$CACHE/apl.tag"); dir="$CACHE/apl-$tag"
+    say "Installing AffinityPluginLoader + WineFix $tag into Affinity"
+    # Undo the older "rename the hook to Affinity.exe" method if present.
+    if [ -f "$APPDIR/Affinity.real.exe" ]; then
+        warn "Restoring Affinity.real.exe left by the rename method"
+        mv -f "$APPDIR/Affinity.real.exe" "$APPDIR/Affinity.exe"
+    fi
+    tar -xf "$dir/$APL_BUNDLE" -C "$APPDIR"
+    if [ -d "$APPDIR/plugins" ] && [ ! -L "$APPDIR/plugins" ]; then rm -rf "$APPDIR/plugins"; fi   # pre-0.3 layout
+    mkdir -p "$APPDIR/apl/plugins"
+    if [ -f "$dir/LoginFix.dll" ]; then cp "$dir/LoginFix.dll" "$APPDIR/apl/plugins/"; ok "LoginFix installed"; fi
+    # File logging makes problems diagnosable (apl/logs/apl.latest.log).
+    local cfg="$APPDIR/apl/config/apl.toml"
+    if [ -f "$cfg" ]; then sed -i 's/^file_logging = false/file_logging = true/' "$cfg"; fi
+}
+
+ensure_ndp48() {
+    local f
+    for f in "$HOME/.cache/winetricks/dotnet48/ndp48-x86-x64-allos-enu.exe" \
+             "$HOME/.var/app/net.lutris.Lutris/cache/winetricks/dotnet48/ndp48-x86-x64-allos-enu.exe" \
+             "$CACHE/ndp48-x86-x64-allos-enu.exe"; do
+        [ -f "$f" ] && [ "$(sha256_of "$f")" = "$NDP48_SHA256" ] && { echo "$f"; return; }
+    done
+    say "Downloading the .NET Framework 4.8 installer from Microsoft (~70 MB)" >&2
+    mkdir -p "$CACHE"
+    curl -fL --progress-bar -o "$CACHE/ndp48.part" "$NDP48_URL" >&2
+    [ "$(sha256_of "$CACHE/ndp48.part")" = "$NDP48_SHA256" ] || { rm -f "$CACHE/ndp48.part"; die "ndp48 checksum mismatch"; }
+    mv "$CACHE/ndp48.part" "$CACHE/ndp48-x86-x64-allos-enu.exe"
+    echo "$CACHE/ndp48-x86-x64-allos-enu.exe"
+}
+
+install_facades() {
+    local net="$AFF_PREFIX/drive_c/windows/Microsoft.NET" missing=0 entry name hash
+    [ -d "$net/Framework64/v4.0.30319" ] || { warn ".NET 4.x not in prefix; skipping WinRT facades (install dotnet48 first)"; return; }
+    for entry in "${FACADES[@]}"; do
+        name=${entry%|*}
+        [ -f "$net/assembly/GAC_MSIL/$name/v4.0_4.0.0.0__b77a5c561934e089/$name.dll" ] || missing=1
+    done
+    [ $missing = 0 ] && { ok "WinRT .NET facades present"; return; }
+    command -v 7z >/dev/null || die "7z (p7zip) is needed to extract the .NET facades"
+    local ndp work; ndp=$(ensure_ndp48); work=$(mktemp -d)
+    say "Extracting WinRT .NET facades from Microsoft's .NET 4.8 installer"
+    7z x -y -o"$work/1" "$ndp" "$NDP48_CAB" >/dev/null
+    7z x -y -o"$work/2" "$work/1/$NDP48_CAB" 'msil_system.runtime.windowsruntime*/*.dll' >/dev/null
+    for entry in "${FACADES[@]}"; do
+        name=${entry%|*}; hash=${entry#*|}
+        local src; src=$(find "$work/2" -iname "$name.dll" -path '*msil_*' | head -1)
+        [ -n "$src" ] && [ "$(sha256_of "$src")" = "$hash" ] || { rm -rf "$work"; die "$name.dll missing or checksum mismatch"; }
+        local gac="$net/assembly/GAC_MSIL/$name/v4.0_4.0.0.0__b77a5c561934e089"
+        mkdir -p "$gac"
+        cp "$src" "$gac/$name.dll"
+        cp "$src" "$net/Framework/v4.0.30319/$name.dll"
+        cp "$src" "$net/Framework64/v4.0.30319/$name.dll"
+        ok "Installed $name.dll"
+    done
+    rm -rf "$work"
+}
+
+disable_crashpad() {
+    # Serif's crash reporter keeps Affinity.exe alive after quitting under Wine, so
+    # Lutris never sees the app exit. Stop Wine from starting it.
+    run_wine reg add 'HKCU\Software\Wine\DllOverrides' /v crashpad_handler.exe /t REG_SZ /d '' /f >/dev/null 2>&1 \
+        && ok "Crash reporter disabled (fixes Affinity not fully closing)" \
+        || warn "Couldn't set the crashpad_handler.exe override"
+}
+
+register_url_handler() {
+    mkdir -p "$APPS_DIR" "$BIN_DIR"
+    ln -sf "$SELF" "$BIN_DIR/affinity-fix"
+    cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Affinity URL Handler
+Comment=Passes affinity:// sign-in callbacks to Affinity running under Wine
+Exec=$BIN_DIR/affinity-fix open-url %u
+MimeType=x-scheme-handler/affinity;
+NoDisplay=true
+Terminal=false
+EOF
+    update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+    xdg-mime default "$(basename "$DESKTOP_FILE")" x-scheme-handler/affinity 2>/dev/null || true
+    ok "affinity:// handler registered (Canva sign-in callback)"
+}
+
+point_lutris_at_hook() {
+    [ -n "$AFF_LUTRIS_YML" ] || return 0
+    if grep -qE '^  exe: .*/AffinityHook\.exe' "$AFF_LUTRIS_YML"; then ok "Lutris already launches AffinityHook.exe"; return; fi
+    pgrep -f 'lutris' >/dev/null && warn "Lutris is running; it may overwrite this change - restart Lutris after install"
+    cp "$AFF_LUTRIS_YML" "$AFF_LUTRIS_YML.affinity-fix.bak"
+    sed -i -E 's#^(  exe: .*/Affinity/Affinity/)Affinity\.exe$#\1AffinityHook.exe#' "$AFF_LUTRIS_YML"
+    ok "Lutris now launches AffinityHook.exe (backup: $(basename "$AFF_LUTRIS_YML").affinity-fix.bak)"
+}
+
+apply_all() {
+    fetch_plugins
+    apply_plugins
+    install_facades
+    disable_crashpad
+    register_url_handler
+    point_lutris_at_hook
+    run_wineserver -w 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- commands
+cmd_install() {
+    command -v curl >/dev/null || die "curl is required"
+    command -v python3 >/dev/null || die "python3 is required"
+    detect_setup
+    APPDIR="$AFF_PREFIX/drive_c/Program Files/Affinity/Affinity"
+    [ -f "$APPDIR/Affinity.exe" ] || die "Affinity.exe not found in $APPDIR - install Affinity first"
+    say "Prefix:  $AFF_PREFIX"
+    say "Wine:    $AFF_WINE$([ "$AFF_FLATPAK_LUTRIS" = 1 ] && echo ' (inside Flatpak Lutris)')"
+    [ -n "$AFF_LUTRIS_YML" ] && say "Lutris:  $AFF_LUTRIS_YML"
+    say "Affinity $(installed_version)"
+    affinity_running && die "Affinity is running. Close it first."
+    save_config
+    mkdir -p "$CACHE"
+    snapshot_prefix
+    apply_all
+    echo
+    ok "${B}Done.${N} Launch Affinity as usual$([ -n "$AFF_LUTRIS_YML" ] && echo ' from Lutris')."
+    if [ -z "$AFF_LUTRIS_YML" ]; then echo "    Make your launcher run: $APPDIR/AffinityHook.exe (not Affinity.exe)"; fi
+    echo "    Update later with: affinity-fix update"
+}
+
+remote_stamp() {
+    curl -sfIL "$AFFINITY_INSTALLER_URL" | tr -d '\r' | awk -F': ' \
+        'tolower($1)=="last-modified"{lm=$2} tolower($1)=="content-length"{cl=$2} END{if(lm) print lm" ("cl" bytes)"}'
+}
+
+cmd_check() {
+    load_config
+    local remote local_stamp
+    remote=$(remote_stamp || true); local_stamp=$(cat "$CACHE/installer.stamp" 2>/dev/null || echo "never")
+    echo "Affinity installed:      $(installed_version)"
+    echo "Latest installer:        ${remote:-unreachable}"
+    echo "Last installed by tool:  $local_stamp"
+    [ -n "$remote" ] && [ "$remote" != "$local_stamp" ] && echo "${YE}-> An update is probably available: affinity-fix update${N}"
+    echo
+    [ -f "$APPDIR/AffinityHook.exe" ] && ok "Plugin loader installed ($(cat "$CACHE/apl.tag" 2>/dev/null))" || warn "Plugin loader missing"
+    [ -f "$APPDIR/apl/plugins/WineFix.dll" ] && ok "WineFix" || warn "WineFix missing"
+    [ -f "$APPDIR/apl/plugins/LoginFix.dll" ] && ok "LoginFix" || warn "LoginFix missing"
+    [ -f "$AFF_PREFIX/drive_c/windows/Microsoft.NET/assembly/GAC_MSIL/System.Runtime.WindowsRuntime/v4.0_4.0.0.0__b77a5c561934e089/System.Runtime.WindowsRuntime.dll" ] \
+        && ok "WinRT .NET facades" || warn "WinRT .NET facades missing"
+    grep -q '"crashpad_handler.exe"=""' "$AFF_PREFIX/user.reg" 2>/dev/null && ok "Crash reporter disabled" || warn "Crash reporter not disabled"
+    [ "$(xdg-mime query default x-scheme-handler/affinity 2>/dev/null)" = "$(basename "$DESKTOP_FILE")" ] \
+        && ok "affinity:// handler" || warn "affinity:// handler not default"
+    if [ -n "$AFF_LUTRIS_YML" ]; then
+        grep -qE '^  exe: .*/AffinityHook\.exe' "$AFF_LUTRIS_YML" && ok "Lutris launches the hook" || warn "Lutris still launches Affinity.exe"
+    fi
+}
+
+cmd_update() {
+    load_config
+    affinity_running && die "Affinity is running. Close it first."
+    mkdir -p "$CACHE"
+    local remote local_stamp installer="$CACHE/Affinity x64.exe"
+    remote=$(remote_stamp || true); local_stamp=$(cat "$CACHE/installer.stamp" 2>/dev/null || echo "never")
+    say "Installed: $(installed_version)   Latest installer: ${remote:-unreachable}"
+    if [ "${OPT_FORCE:-0}" = 1 ] || { [ -n "$remote" ] && [ "$remote" != "$local_stamp" ]; }; then
+        say "Downloading the Affinity installer (~1 GB)"
+        curl -fL --progress-bar -o "$installer.part" "$AFFINITY_INSTALLER_URL"
+        mv -f "$installer.part" "$installer"
+        snapshot_prefix
+        say "Running the Affinity installer - click through it. If it opens Affinity at the end, close Affinity."
+        run_wine "$installer" || warn "Installer exited with status $?"
+        run_wineserver -w 2>/dev/null || true
+        echo "$remote" > "$CACHE/installer.stamp"
+        say "Affinity is now $(installed_version)"
+    else
+        ok "Affinity installer unchanged since your last update (use --force to reinstall)"
+    fi
+    apply_all
+    ok "Done."
+}
+
+cmd_plugins() {
+    load_config
+    affinity_running && die "Affinity is running. Close it first."
+    mkdir -p "$CACHE"
+    apply_all
+}
+
+cmd_uninstall() {
+    load_config
+    affinity_running && die "Affinity is running. Close it first."
+    local f
+    for f in "${APL_FILES[@]}"; do rm -f "$APPDIR/$f"; done
+    rm -rf "$APPDIR/apl"
+    ok "Removed plugin loader, WineFix and LoginFix"
+    run_wine reg delete 'HKCU\Software\Wine\DllOverrides' /v crashpad_handler.exe /f >/dev/null 2>&1 || true
+    run_wineserver -w 2>/dev/null || true
+    ok "Re-enabled crash reporter"
+    if [ -n "$AFF_LUTRIS_YML" ]; then
+        sed -i -E 's#^(  exe: .*/Affinity/Affinity/)AffinityHook\.exe$#\1Affinity.exe#' "$AFF_LUTRIS_YML"
+        ok "Lutris launches Affinity.exe again"
+    fi
+    rm -f "$DESKTOP_FILE" "$BIN_DIR/affinity-fix"
+    update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+    ok "Removed affinity:// handler"
+    echo "Left in place: the WinRT .NET facades (harmless), backups ($AFF_PREFIX.backup-*), $CONFIG, $CACHE"
+}
+
+cmd_open_url() {
+    load_config
+    # Launch the exe directly: `wine start` crashes on the ~1700-char sign-in callback URL.
+    run_wine "$APPDIR/AffinityHook.exe" "$@"
+}
+
+# ---------------------------------------------------------------- main
+cmd=${1:-}; shift || true
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --prefix) OPT_PREFIX=$2; shift ;;
+        --wine) OPT_WINE=$2; shift ;;
+        --flatpak-lutris) OPT_FLATPAK=1 ;;
+        --lutris-yml) OPT_YML=$2; shift ;;
+        --no-backup) OPT_NO_BACKUP=1 ;;
+        --force) OPT_FORCE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) [ "$cmd" = open-url ] && break; die "Unknown option: $1" ;;
+    esac
+    shift
+done
+
+case "$cmd" in
+    install) cmd_install ;;
+    update) cmd_update ;;
+    check) cmd_check ;;
+    plugins) cmd_plugins ;;
+    uninstall) cmd_uninstall ;;
+    open-url) cmd_open_url "$@" ;;
+    -v|--version|version) echo "affinity-fix $VERSION" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "Unknown command: $cmd (see affinity-fix --help)" ;;
+esac
