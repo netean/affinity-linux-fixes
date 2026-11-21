@@ -22,7 +22,7 @@ affinity-fix update
 |---|---|---|
 | Menu changes, custom workspaces and preferences aren't saved | [WineFix](https://github.com/noahc3/AffinityPluginLoader) patches the save-on-exit bug | ✅ Confirmed |
 | Affinity doesn't fully close, so Lutris still shows it running | Disables Serif's crash reporter (`crashpad_handler.exe`), which kept the process alive after quitting | ✅ Confirmed |
-| Canva sign-in: the browser login works but Affinity crashes when the login is passed back | Installs the missing .NET WinRT libraries, [LoginFix](https://github.com/seapear/AffinityOnLinux/tree/main/Guides/Wine/LoginFix), and an `affinity://` link handler that doesn't crash on the long callback URL | 🧪 Testing |
+| Canva sign-in: the browser login works but Affinity crashes when the login is passed back | Installs the missing .NET WinRT libraries, [LoginFix](https://github.com/seapear/AffinityOnLinux/tree/main/Guides/Wine/LoginFix), and an `affinity://` link handler that doesn't crash on the long callback URL | ✅ Confirmed |
 | Vector pen preview line is drawn in the wrong place | WineFix's patched `d2d1.dll` | ✅ Included (upstream fix) |
 | Colour picker zoom preview is black on Wayland | WineFix | ✅ Included (upstream fix) |
 | Colour picker can't sample outside the canvas | — | ❌ No fix exists yet (Wine limitation) |
@@ -81,7 +81,7 @@ Logs, if something goes wrong:
 ## Known issues
 
 - **Colour picker outside the canvas** still doesn't work. WineFix has a fix planned using the desktop's colour-picking API.
-- **Wine 11.x.** A user report says the WinRT libraries alone aren't enough for sign-in on Wine 11.12. So far, sign-in has only been confirmed on ElementalWarrior Wine and Wine 10.x.
+- **Wine 11.x.** A user report says the WinRT libraries alone aren't enough for sign-in on Wine 11.12. Sign-in is confirmed on ElementalWarrior Wine; Wine 11 hasn't been tested with this tool.
 - **Crash reporting is off.** Under Wine, accepting crash reporting causes repeated crashes anyway (a known WineFix issue).
 - Settings tweaks for WineFix (colour picker sampling mode and so on) are in `apl/config/winefix.toml`, or in Affinity's Preferences under WineFix.
 
